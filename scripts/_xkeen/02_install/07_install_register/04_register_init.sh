@@ -31,6 +31,7 @@ log_dir="/opt/var/log"
 xkeen_cfg="/opt/etc/xkeen"
 ipset_cfg="$xkeen_cfg/ipset"
 install_dir="/opt/sbin"
+yq_bin="$install_dir/yq"
 
 # Файлы
 file_netfilter_hook="/opt/etc/ndm/netfilter.d/proxy.sh"
@@ -224,8 +225,14 @@ ${custom_details}"
 utils="jq curl grep awk sed ipset"
 [ "$name_client" = "mihomo" ] && utils="$utils yq"
 for cmd in $utils; do
-    command -v "$cmd" >/dev/null 2>&1 || log_error_terminal "Не найдена необходимая утилита: ${yellow}$cmd${reset}"
+    if [ "$cmd" = "yq" ]; then
+        [ -x "$yq_bin" ] || log_error_terminal "Не найдена необходимая утилита: ${yellow}$yq_bin${reset}"
+    else
+        command -v "$cmd" >/dev/null 2>&1 || log_error_terminal "Не найдена необходимая утилита: ${yellow}$cmd${reset}"
+    fi
 done
+
+run_yq() { "$yq_bin" "$@"; }
 
 log_clean() { [ "$name_client" = "xray" ] && : > "$log_access" && : > "$log_error"; }
 
@@ -534,11 +541,15 @@ validate_client_routing_mark() {
         config_hint="  Для Mihomo задайте ${green}routing-mark${reset} глобально либо у нужных ${yellow}proxies${reset}/${yellow}proxy-providers${reset}"
 
         if [ -f "$mihomo_config" ]; then
-            mihomo_json=$(yq -o=json '.' "$mihomo_config" 2>&1)
+            mihomo_json=$(run_yq -o=json '.' "$mihomo_config" 2>&1)
             mihomo_json_rc=$?
 
             if [ "$mihomo_json_rc" -ne 0 ]; then
-                validation_errors=$(append_multiline "$validation_errors" "$(basename "$mihomo_config"): $mihomo_json")
+                validation_errors=$(append_multiline "$validation_errors" "$(basename "$mihomo_config"): yq не смог преобразовать YAML в JSON: $mihomo_json")
+            elif [ -z "$mihomo_json" ]; then
+                validation_errors=$(append_multiline "$validation_errors" "$(basename "$mihomo_config"): yq вернул пустой вывод")
+            elif ! printf '%s' "$mihomo_json" | jq -e . >/dev/null 2>&1; then
+                validation_errors=$(append_multiline "$validation_errors" "$(basename "$mihomo_config"): yq вернул невалидный JSON; проверь bundled yq: $yq_bin")
             else
                 root_kind=$(printf '%s' "$mihomo_json" | jq -r 'type' 2>&1)
                 root_kind_rc=$?
@@ -673,8 +684,13 @@ ${light_blue}${bad_list}${reset}"
     fi
 
     if [ "$validation_mode" = "pbr" ]; then
+        if [ -n "$bad_items" ]; then
+            summary_msg="Включена strict PBR-проверка, но у исходящих подключений ${yellow}${name_client}${reset} не найден корректный ${yellow}mark/routing-mark${reset} политики Keenetic"
+        else
+            summary_msg="Включена strict PBR-проверка, но конфигурацию ${yellow}${name_client}${reset} не удалось полностью проверить на ${yellow}mark/routing-mark${reset} политики Keenetic"
+        fi
         log_error_terminal "
-  Включена strict PBR-проверка, но у исходящих подключений ${yellow}${name_client}${reset} не найден корректный ${yellow}mark/routing-mark${reset} политики Keenetic$error_details
+  ${summary_msg}${error_details}
 
   Разрешённые policy marks Keenetic: ${yellow}${allowed_marks_display}${reset}
 $config_hint
@@ -683,8 +699,13 @@ $config_hint
   Управление режимом: ${yellow}xkeen -pbr on${reset} | ${yellow}xkeen -pbr off${reset} | ${yellow}xkeen -pbr status${reset}
 "
     else
+        if [ -n "$bad_items" ]; then
+            summary_msg="Проксирование Entware включено, но у исходящих подключений ${yellow}${name_client}${reset} не найден ${yellow}mark/routing-mark${reset} для bypass"
+        else
+            summary_msg="Проксирование Entware включено, но конфигурацию ${yellow}${name_client}${reset} не удалось полностью проверить на ${yellow}mark/routing-mark${reset} для bypass"
+        fi
         log_warning_terminal "
-  Проксирование Entware включено, но у исходящих подключений ${yellow}${name_client}${reset} не найден ${yellow}mark/routing-mark${reset} для bypass$error_details
+  ${summary_msg}${error_details}
 
   Для обычного Entware proxy можно использовать служебную метку ${yellow}255${reset}
   Разрешённые bypass marks: ${yellow}${allowed_marks_display}${reset}
@@ -859,7 +880,7 @@ check_dns_config() {
             strip_json_comments "$file" | jq -e '.dns.servers? != null' >/dev/null 2>&1 && { echo "true"; return; }
         done
     elif [ "$name_client" = "mihomo" ]; then
-        [ -f "$mihomo_config" ] && yq -e '.dns.enable == true' "$mihomo_config" >/dev/null 2>&1 && { echo "true"; return; }
+        [ -f "$mihomo_config" ] && run_yq -e '.dns.enable == true' "$mihomo_config" >/dev/null 2>&1 && { echo "true"; return; }
     fi
 
     echo "false"
@@ -1176,13 +1197,13 @@ get_mihomo_listener_field_by_name() {
     listener_name="$1"
     field_name="$2"
 
-    DSCP_FORCE_LISTENER="$listener_name" yq eval ".listeners[] | select(.name == strenv(DSCP_FORCE_LISTENER)) | .$field_name // \"\"" "$mihomo_config" 2>/dev/null | sed -n '1p'
+    DSCP_FORCE_LISTENER="$listener_name" run_yq eval ".listeners[] | select(.name == strenv(DSCP_FORCE_LISTENER)) | .$field_name // \"\"" "$mihomo_config" 2>/dev/null | sed -n '1p'
 }
 
 get_mihomo_listener_rule_proxy_by_name() {
     listener_name="$1"
 
-    yq eval '.rules[] // ""' "$mihomo_config" 2>/dev/null | awk -F',' -v tag="$listener_name" '
+    run_yq eval '.rules[] // ""' "$mihomo_config" 2>/dev/null | awk -F',' -v tag="$listener_name" '
         {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
@@ -1220,9 +1241,9 @@ get_port_redirect() {
         port=$(get_xray_port_by_mode "redirect")
         [ -n "$port" ] && echo "$port" && return 0
     elif [ "$name_client" = "mihomo" ]; then
-        port=$(yq eval '.redir-port // ""' "$mihomo_config" 2>/dev/null)
+        port=$(run_yq eval '.redir-port // ""' "$mihomo_config" 2>/dev/null)
         if [ -z "$port" ]; then
-            port=$(DSCP_FORCE_TAG="$dscp_force_proxy_tag" DSCP_FORCE_TAG_REDIRECT="${dscp_force_proxy_tag}-redirect" DSCP_FORCE_TAG_TPROXY="${dscp_force_proxy_tag}-tproxy" yq eval '.listeners[] | select(.type == "redir" and (.name // "") != strenv(DSCP_FORCE_TAG) and (.name // "") != strenv(DSCP_FORCE_TAG_REDIRECT) and (.name // "") != strenv(DSCP_FORCE_TAG_TPROXY)) | .port // ""' "$mihomo_config" 2>/dev/null | sed -n '1p')
+            port=$(DSCP_FORCE_TAG="$dscp_force_proxy_tag" DSCP_FORCE_TAG_REDIRECT="${dscp_force_proxy_tag}-redirect" DSCP_FORCE_TAG_TPROXY="${dscp_force_proxy_tag}-tproxy" run_yq eval '.listeners[] | select(.type == "redir" and (.name // "") != strenv(DSCP_FORCE_TAG) and (.name // "") != strenv(DSCP_FORCE_TAG_REDIRECT) and (.name // "") != strenv(DSCP_FORCE_TAG_TPROXY)) | .port // ""' "$mihomo_config" 2>/dev/null | sed -n '1p')
         fi
         [ -n "$port" ] && echo "$port" && return 0
     else
@@ -1236,9 +1257,9 @@ get_port_tproxy() {
         port=$(get_xray_port_by_mode "tproxy")
         [ -n "$port" ] && echo "$port" && return 0
     elif [ "$name_client" = "mihomo" ]; then
-        port=$(yq eval '.tproxy-port // ""' "$mihomo_config" 2>/dev/null)
+        port=$(run_yq eval '.tproxy-port // ""' "$mihomo_config" 2>/dev/null)
         if [ -z "$port" ]; then
-            port=$(DSCP_FORCE_TAG="$dscp_force_proxy_tag" DSCP_FORCE_TAG_REDIRECT="${dscp_force_proxy_tag}-redirect" DSCP_FORCE_TAG_TPROXY="${dscp_force_proxy_tag}-tproxy" yq eval '.listeners[] | select(.type == "tproxy" and (.name // "") != strenv(DSCP_FORCE_TAG) and (.name // "") != strenv(DSCP_FORCE_TAG_REDIRECT) and (.name // "") != strenv(DSCP_FORCE_TAG_TPROXY)) | .port // ""' "$mihomo_config" 2>/dev/null | sed -n '1p')
+            port=$(DSCP_FORCE_TAG="$dscp_force_proxy_tag" DSCP_FORCE_TAG_REDIRECT="${dscp_force_proxy_tag}-redirect" DSCP_FORCE_TAG_TPROXY="${dscp_force_proxy_tag}-tproxy" run_yq eval '.listeners[] | select(.type == "tproxy" and (.name // "") != strenv(DSCP_FORCE_TAG) and (.name // "") != strenv(DSCP_FORCE_TAG_REDIRECT) and (.name // "") != strenv(DSCP_FORCE_TAG_TPROXY)) | .port // ""' "$mihomo_config" 2>/dev/null | sed -n '1p')
         fi
         [ -n "$port" ] && echo "$port" && return 0
     else
@@ -2729,7 +2750,7 @@ check_binary() {
     [ "$file" = "yq" ] && check_cmd="--version"
     [ "$file" = "mihomo" ] && check_cmd="-v"
 
-    if ! "$file" $check_cmd >/dev/null 2>&1; then
+    if ! "$path" $check_cmd >/dev/null 2>&1; then
         log_error_router "Бинарный файл $file аварийно остановлен"
         log_error_terminal "
   Бинарный файл ${yellow}$file${reset} аварийно остановлен
